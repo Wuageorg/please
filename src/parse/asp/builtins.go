@@ -929,28 +929,14 @@ func getLabels(s *scope, args []pyObject) pyObject {
 	prefix := string(args[1].(pyString))
 	all := args[2].IsTruthy()
 	transitive := args[3].IsTruthy()
-	if core.LooksLikeABuildLabel(name) {
-		label := core.ParseBuildLabel(name, s.pkg.Name)
-		return getLabelsInternal(s.state.Graph.TargetOrDie(label), prefix, core.Built, all, transitive)
-	}
-	target := getTargetPost(s, name)
+	target := getTarget(s, name, false)
 	return getLabelsInternal(target, prefix, core.Building, all, transitive)
 }
 
 // addLabel adds a set of labels to the named rule
 func addLabel(s *scope, args []pyObject) pyObject {
-	name := string(args[0].(pyString))
-
-	var target *core.BuildTarget
-	if core.LooksLikeABuildLabel(name) {
-		label := core.ParseBuildLabel(name, s.pkg.Name)
-		target = s.state.Graph.TargetOrDie(label)
-	} else {
-		target = getTargetPost(s, name)
-	}
-
+	target := getTarget(s, string(args[0].(pyString)), true)
 	target.AddLabel(args[1].String())
-
 	return None
 }
 
@@ -993,22 +979,41 @@ func getLabelsInternal(target *core.BuildTarget, prefix string, minState core.Bu
 	return fromStringList(ret)
 }
 
-// getTargetPost is called by various functions to get a target from the current package.
-// Panics if the target is not in the current package or has already been built.
-func getTargetPost(s *scope, name string) *core.BuildTarget {
-	target := s.pkg.Target(name)
+// getTarget is called by various functions to get a target from the package graph.
+// Can wait for non local target to exist using WaitForTarget
+// set modify to true if caller intend to modify target
+// Panics if the target is not found
+func getTarget(s *scope, name string, modify bool) *core.BuildTarget {
+	var target *core.BuildTarget
+	if core.LooksLikeABuildLabel(name) {
+		label := core.ParseBuildLabel(name, s.pkg.Name)
+		local := (label.PackageName == s.pkg.Name)
+		local = local && (label.Subrepo == s.pkg.SubrepoName)
+		if local {
+			target = s.state.Graph.TargetOrDie(label)
+		} else {
+			pkgLabel := s.pkg.Label()
+			target = s.state.WaitForBuiltTarget(label, pkgLabel, core.ParseModeNormal)
+			//nolint:staticcheck
+			s.Assert(pkgLabel.CanSee(s.state, target), "Target %s isn't visible to %s", label, pkgLabel)
+		}
+	} else {
+		target = s.pkg.Target(name)
+	}
 	//nolint:staticcheck
 	s.Assert(target != nil, "Unknown build target %s in %s", name, s.pkg.Name)
-	// It'd be cheating to try to modify targets that're already built.
-	// Prohibit this because it'd likely end up with nasty race conditions.
-	s.Assert(target.State() < core.Built, "Attempted to modify target %s, but it's already built", target.Label) //nolint:staticcheck
+	if modify {
+		// It'd be cheating to try to modify targets that are already built.
+		// Prohibit this because it'd likely end up with nasty race conditions.
+		s.Assert(target.State() < core.Built, "Attempted to modify target %s, but it's already built", target.Label) //nolint:staticcheck
+	}
 	return target
 }
 
 // addDep adds a dependency to a target.
 func addDep(s *scope, args []pyObject) pyObject {
 	s.Assert(s.Callback, "can only be called from a pre- or post-build callback")
-	target := getTargetPost(s, string(args[0].(pyString)))
+	target := getTarget(s, string(args[0].(pyString)), true)
 	dep := s.parseLabelInPackage(string(args[1].(pyString)), s.pkg)
 	exported := args[2].IsTruthy()
 	target.AddMaybeExportedDependency(dep, exported, false, false)
@@ -1044,7 +1049,7 @@ func addData(s *scope, args []pyObject) pyObject {
 
 	label := args[0]
 	datum := args[1]
-	target := getTargetPost(s, string(label.(pyString)))
+	target := getTarget(s, string(label.(pyString)), true)
 
 	systemAllowed := false
 	tool := false
@@ -1076,7 +1081,7 @@ func addData(s *scope, args []pyObject) pyObject {
 
 // addOut adds an output to a target.
 func addOut(s *scope, args []pyObject) pyObject {
-	target := getTargetPost(s, string(args[0].(pyString)))
+	target := getTarget(s, string(args[0].(pyString)), true)
 	name := string(args[1].(pyString))
 	out := string(args[2].(pyString))
 	if out == "" {
@@ -1094,14 +1099,7 @@ func addOut(s *scope, args []pyObject) pyObject {
 
 // getOuts gets the outputs of a target
 func getOuts(s *scope, args []pyObject) pyObject {
-	var target *core.BuildTarget
-	if name := args[0].String(); core.LooksLikeABuildLabel(name) {
-		label := core.ParseBuildLabel(name, s.pkg.Name)
-		target = s.state.Graph.TargetOrDie(label)
-	} else {
-		target = getTargetPost(s, name)
-	}
-
+	target := getTarget(s, args[0].String(), false)
 	outs := target.Outputs()
 	ret := make(pyList, len(outs))
 	for i, out := range outs {
@@ -1112,14 +1110,7 @@ func getOuts(s *scope, args []pyObject) pyObject {
 
 // getNamedOuts gets the named outputs of a target
 func getNamedOuts(s *scope, args []pyObject) pyObject {
-	var target *core.BuildTarget
-	if name := args[0].String(); core.LooksLikeABuildLabel(name) {
-		label := core.ParseBuildLabel(name, s.pkg.Name)
-		target = s.state.Graph.TargetOrDie(label)
-	} else {
-		target = getTargetPost(s, name)
-	}
-
+	target := getTarget(s, args[0].String(), false)
 	var outs map[string][]string
 	if target.IsFilegroup {
 		outs = target.DeclaredNamedSources()
@@ -1140,19 +1131,19 @@ func getNamedOuts(s *scope, args []pyObject) pyObject {
 
 // addLicence adds a licence to a target.
 func addLicence(s *scope, args []pyObject) pyObject {
-	target := getTargetPost(s, string(args[0].(pyString)))
+	target := getTarget(s, string(args[0].(pyString)), true)
 	target.AddLicence(string(args[1].(pyString)))
 	return None
 }
 
 // getLicences returns the licences for a single target.
 func getLicences(s *scope, args []pyObject) pyObject {
-	return fromStringList(getTargetPost(s, string(args[0].(pyString))).Licences)
+	return fromStringList(getTarget(s, string(args[0].(pyString)), false).Licences)
 }
 
 // getCommand gets the command of a target, optionally for a configuration.
 func getCommand(s *scope, args []pyObject) pyObject {
-	target := getTargetPost(s, string(args[0].(pyString)))
+	target := getTarget(s, string(args[0].(pyString)), false)
 	config := string(args[1].(pyString))
 	if config != "" {
 		return pyString(target.GetCommandConfig(config))
@@ -1179,7 +1170,7 @@ func valueAsJSON(s *scope, args []pyObject) pyObject {
 
 // setCommand sets the command of a target, optionally for a configuration.
 func setCommand(s *scope, args []pyObject) pyObject {
-	target := getTargetPost(s, string(args[0].(pyString)))
+	target := getTarget(s, string(args[0].(pyString)), true)
 	config := string(args[1].(pyString))
 	command := string(args[2].(pyString))
 	if command == "" {
