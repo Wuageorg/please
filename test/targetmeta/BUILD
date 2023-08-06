@@ -52,3 +52,13 @@ please_repo_e2e_test(
     expected_failure = True,
     repo = "error/non_visible_target",
 )
+
+please_repo_e2e_test(
+    name = "targetmeta_dep_cycle",
+    plz_command = "plz build",
+    expect_output_contains = {
+        "plz-out/log/build.log": "cycle detected"
+    },
+    expected_failure = True,
+    repo = "error/dep_cycle",
+)
