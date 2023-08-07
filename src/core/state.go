@@ -228,6 +228,11 @@ type BuildState struct {
 	// they're encountered.
 	EnableBreakpoints bool
 
+	// WaitTargetCycleDetector keep a registry of waiter and waitee and check there is no cycle
+	waitTargetCycleDetector map[BuildLabel][]BuildLabel
+	waitTargetCycleDetectorAdd chan ParseTask
+	waitTargetCycleDetectorRm chan ParseTask
+
 	// initOnce is used to control loading the subrepo .plzconfig
 	initOnce *sync.Once
 
@@ -866,7 +871,10 @@ func (state *BuildState) waitForBuiltTarget(l, dependent BuildLabel, mode ParseM
 	// okay, we need to register and wait for this guy.
 	if ch, inserted := state.progress.pendingTargets.AddOrGet(l, make(chan struct{})); !inserted {
 		// Something's already registered for this, get on the train
+		// FIXME cycle detector here a goroutine that follow new wait event and tries to find to come back to first one
+		state.waitTargetCycleDetectorAdd <- ParseTask{Label: l, Dependent: dependent, Mode: mode}
 		<-ch
+		state.waitTargetCycleDetectorRm <- ParseTask{Label: l, Dependent: dependent, Mode: mode}
 		return state.Graph.Target(l)
 	}
 	if err := state.queueTarget(l, dependent, mode.IsForSubinclude(), mode); err != nil {
@@ -1385,6 +1393,9 @@ func NewBuildState(config *Configuration) *BuildState {
 			internalResults: make(chan *BuildResult, 1000),
 			cycleDetector:   cycleDetector{graph: graph},
 		},
+		waitTargetCycleDetectorAdd:  make(chan ParseTask, 1000),
+		waitTargetCycleDetectorRm:   make(chan ParseTask, 1000),
+		waitTargetCycleDetector:     make(map[BuildLabel][]BuildLabel),
 		initOnce:            new(sync.Once),
 		preloadDownloadOnce: new(sync.Once),
 	}
@@ -1396,7 +1407,79 @@ func NewBuildState(config *Configuration) *BuildState {
 		state.experimentalLabels = append(state.experimentalLabels, BuildLabel{PackageName: exp, Name: "..."})
 	}
 	go state.forwardResults()
+	go state.waitTargetCycleDetectorFunc()
 	return state
+}
+
+func isMapCycle(m *map[BuildLabel][]BuildLabel, start BuildLabel, current *BuildLabel) bool {
+	if current != nil && *current == start {
+		return true
+	}
+	if current == nil {
+		current = &start
+	}
+	childs, ok := (*m)[*current]
+	if !ok {
+		return false
+	}
+	for _, child := range childs {
+		if isMapCycle(m, start, &child) {
+			return true
+		}
+	}
+	return false
+}
+
+func (state *BuildState) waitTargetCycleDetectorFunc() {
+	loop:
+	select {
+		case ptask := <-state.waitTargetCycleDetectorAdd:
+			if ptask.Mode == ParseModeForSubinclude {
+				// ignore
+				goto loop
+			}
+			ptask.Dependent.Name = ""
+			ptask.Label.Name = ""
+			if ptask.Dependent == ptask.Label {
+				// ignore
+				goto loop
+			}
+			state.waitTargetCycleDetector[ptask.Dependent] = append(
+				state.waitTargetCycleDetector[ptask.Dependent],
+				ptask.Label)
+			if isMapCycle(&state.waitTargetCycleDetector, ptask.Dependent, nil) {
+				cyclestr := ""
+				for k, v := range state.waitTargetCycleDetector {
+					dstr := ""
+					first := true
+					for _, s := range v {
+						if first {
+							dstr += s.String()
+							first = false
+						} else {
+							dstr += ", " + s.String()
+						}
+					}
+					cyclestr += "[" + k.String() + "]{" + dstr + "}\n"
+				}
+				log.Fatalf("Dependencies cycle detected:\n%s", cyclestr)
+			}
+		case ptask := <-state.waitTargetCycleDetectorRm:
+			ptask.Dependent.Name = ""
+			ptask.Label.Name = ""
+			childs, ok := state.waitTargetCycleDetector[ptask.Dependent]
+			if ok {
+				for i, _ := range childs {
+					if childs[i] == ptask.Label {
+						state.waitTargetCycleDetector[ptask.Dependent] = append(state.waitTargetCycleDetector[ptask.Dependent][:i], state.waitTargetCycleDetector[ptask.Dependent][i + 1:]...)
+					}
+				}
+				if len(state.waitTargetCycleDetector[ptask.Dependent]) == 0 {
+					delete(state.waitTargetCycleDetector, ptask.Dependent)
+				}
+		}
+	}
+	goto loop
 }
 
 // NewDefaultBuildState creates a BuildState for the default configuration.
